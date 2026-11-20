@@ -21,6 +21,8 @@ jobs:
           python3 - << 'EOF'
           import glob, os, re, subprocess
 
+          NL = chr(10)
+
           def extract_braced(text, open_brace_idx):
               depth = 0
               i = open_brace_idx
@@ -48,13 +50,13 @@ jobs:
                       color_block = "  " + m_txt[m_col.start():end_i] + ";"
               inject_dd = ""
               if "Color" not in dd_txt:
-                  inject_dd += "\n" + color_block
+                  inject_dd += NL + color_block
               if "supportsBrightness" not in dd_txt:
-                  inject_dd += "\n  virtual bool supportsBrightness() { return false; }"
+                  inject_dd += NL + "  virtual bool supportsBrightness() { return false; }"
               if inject_dd:
                   dd_txt = re.sub(
                       r'(class\s+DisplayDriver\b[^{]*\{[\s\S]*?\bpublic\s*:)',
-                      r'\1' + inject_dd,
+                      lambda m: m.group(1) + inject_dd,
                       dd_txt,
                       count=1
                   )
@@ -88,9 +90,9 @@ jobs:
                               missing_lines.append("  " + clean)
                               existing_ids.add(fname)
                   if missing_lines:
-                      d_np = d_np[:d_end - 1] + "\n  // Campos Mishmesh\n" + "\n".join(missing_lines) + "\n" + d_np[d_end - 1:]
+                      d_np = d_np[:d_end - 1] + NL + "  // Campos Mishmesh" + NL + NL.join(missing_lines) + NL + d_np[d_end - 1:]
                       open(dst_np_file, "w").write(d_np)
-                      print(f"Agregados {len(missing_lines)} campos a CompanionNodePrefs en {dst_np_file}")
+                      print("Agregados campos a CompanionNodePrefs:", len(missing_lines))
 
           # 3. Aplicar diff de Mishmesh en MyMesh.h y MyMesh.cpp
           first_mish = subprocess.check_output(
@@ -108,13 +110,15 @@ jobs:
               hunks, cur = [], []
               for line in diff_txt.splitlines(keepends=True):
                   if line.startswith("@@ "):
-                      if cur: hunks.append(cur)
+                      if cur:
+                          hunks.append(cur)
                       cur = []
                   elif line.startswith(("diff ", "index ", "--- ", "+++ ")):
                       continue
                   elif line.startswith((" ", "+", "-")):
                       cur.append(line)
-              if cur: hunks.append(cur)
+              if cur:
+                  hunks.append(cur)
 
               for h in hunks:
                   old_seq = [l[1:] for l in h if l.startswith((" ", "-"))]
@@ -129,7 +133,8 @@ jobs:
                   before_ctx, after_ctx, seen = [], [], False
                   for l in h:
                       if l.startswith(("+", "-")):
-                          seen = True; after_ctx = []
+                          seen = True
+                          after_ctx = []
                       elif l.startswith(" "):
                           (after_ctx if seen else before_ctx).append(l[1:])
                   if before_ctx:
@@ -144,7 +149,7 @@ jobs:
                           dst_lines = dst_lines[:matches[0]] + added_only + dst_lines[matches[0]:]
               open(f, "w").writelines(dst_lines)
 
-          # 4. Dar acceso friend class UITask a MyMesh y copiar todos los metodos ui* / mishmesh*
+          # 4. Dar acceso friend class UITask a MyMesh y copiar metodos ui* / mishmesh*
           mymesh_h_path = "examples/companion_radio/MyMesh.h"
           mymesh_cpp_path = "examples/companion_radio/MyMesh.cpp"
           mh = open(mymesh_h_path, errors="ignore").read()
@@ -153,4 +158,5 @@ jobs:
           mish_mc = open("_mishmesh/examples/companion_radio/MyMesh.cpp", errors="ignore").read()
 
           if "CompanionNodePrefs" in mh and "typedef CompanionNodePrefs NodePrefs;" not in mh:
-              mh = re.sub(r'(class\s+MyMesh\b)', r'typedef CompanionNodePrefs NodePrefs;\nclass
+              mh = re.sub(
+                  r'(class\s+MyMesh\b)',
