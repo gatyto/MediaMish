@@ -31,7 +31,10 @@ jobs:
                   i += 1
               return txt[idx:], len(txt)
 
-          # 1. Aplicar cambios de Mishmesh (variables, structs, hooks) en MyMesh.h y MyMesh.cpp
+          all_h = [p for p in glob.glob("**/*.h", recursive=True) if not p.startswith(("_mishmesh", ".pio"))]
+          mish_h = glob.glob("_mishmesh/**/*.h", recursive=True)
+
+          # 1. Aplicar cambios de Mishmesh en MyMesh.h y MyMesh.cpp
           first_mish = subprocess.check_output(
               ["git", "-C", "_mishmesh", "log", "--reverse", "--format=%H", "--", "mishmesh", "examples/companion_radio/ui-mishmesh"]
           ).decode().splitlines()[0].strip()
@@ -51,7 +54,6 @@ jobs:
                       cur.append(ln)
               if cur: hunks.append(cur)
 
-              applied = 0
               for h in hunks:
                   old_s = [l[1:] for l in h if l.startswith((" ", "-"))]
                   new_s = [l[1:] for l in h if l.startswith((" ", "+"))]
@@ -61,7 +63,6 @@ jobs:
                   pos = next((i for i in range(len(dst) - len(old_s) + 1) if dst[i:i+len(old_s)] == old_s), -1)
                   if pos != -1:
                       dst = dst[:pos] + new_s + dst[pos+len(old_s):]
-                      applied += 1
                       continue
                   bef, aft, seen = [], [], False
                   for l in h:
@@ -71,45 +72,65 @@ jobs:
                       m = [i for i in range(len(dst) - len(bef) + 1) if dst[i:i+len(bef)] == bef]
                       if len(m) == 1:
                           dst = dst[:m[0]+len(bef)] + add_s + dst[m[0]+len(bef):]
-                          applied += 1
                           continue
                   if aft:
                       m = [i for i in range(len(dst) - len(aft) + 1) if dst[i:i+len(aft)] == aft]
                       if len(m) == 1:
                           dst = dst[:m[0]] + add_s + dst[m[0]:]
-                          applied += 1
               open(f, "w").writelines(dst)
-              print(f"{f}: {applied}/{len(hunks)} bloques aplicados")
 
-          # 2. DisplayDriver.h: Color + supportsBrightness
-          for p in glob.glob("src/**/DisplayDriver.h", recursive=True):
-              t = open(p, errors="ignore").read()
-              add = ""
-              if "Color" not in t: add += NL + "  enum Color { BLACK = 0, WHITE = 1, INVERSE = 2 };"
-              if "supportsBrightness" not in t: add += NL + "  virtual bool supportsBrightness() { return false; }"
-              if add:
-                  t = re.sub(r'(class\s+DisplayDriver\b[^{]*\{[\s\S]*?\bpublic\s*:)', lambda m: m.group(1) + add, t, count=1)
-                  open(p, "w").write(t)
+          # 2. DisplayDriver.h: copiar enum Color exacto desde _mishmesh y supportsBrightness()
+          color_def = "  enum Color { DARK = 0, LIGHT = 1 };"
+          for mp in mish_h:
+              if os.path.basename(mp) == "DisplayDriver.h":
+                  mt = open(mp, errors="ignore").read()
+                  mc = re.search(r'\benum\s+Color\b[^;{]*\{', mt)
+                  if mc:
+                      _, end_c = braced(mt, mc.end() - 1)
+                      color_def = "  " + mt[mc.start():end_c] + ";"
+                      break
 
-          # 3. CompanionNodePrefs: campos de NodePrefs de Mishmesh
-          m_np_f = next((p for p in glob.glob("_mishmesh/**/*.h", recursive=True) if "struct NodePrefs" in open(p, errors="ignore").read()), None)
-          d_np_f = next((p for p in glob.glob("examples/**/*.h", recursive=True) + glob.glob("src/**/*.h", recursive=True) if "struct CompanionNodePrefs" in open(p, errors="ignore").read()), None)
-          if m_np_f and d_np_f:
-              mt, dt = open(m_np_f, errors="ignore").read(), open(d_np_f, errors="ignore").read()
-              ms, ds = re.search(r'\bstruct\s+NodePrefs\b[^{]*\{', mt), re.search(r'\bstruct\s+CompanionNodePrefs\b[^{]*\{', dt)
-              if ms and ds:
-                  mb, _ = braced(mt, ms.end() - 1)
-                  db, de = braced(dt, ds.end() - 1)
-                  seen = set(re.findall(r'\b([A-Za-z_]\w*)\b', db))
-                  extra = []
-                  for ln in mb[1:-1].splitlines():
-                      c = re.sub(r'//.*', '', ln).strip()
-                      if not c or c.startswith(('#', '/*', '*')): continue
-                      mf = re.search(r'\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;', c)
-                      if mf and mf.group(1) not in seen:
-                          extra.append("  " + c); seen.add(mf.group(1))
-                  if extra:
-                      open(d_np_f, "w").write(dt[:de - 1] + NL + NL.join(extra) + NL + dt[de - 1:])
+          for d_dd in [p for p in all_h if os.path.basename(p) == "DisplayDriver.h"]:
+              dt = open(d_dd, errors="ignore").read()
+              add_dd = ""
+              if not re.search(r'\benum\s+Color\b', dt):
+                  add_dd += NL + "public:" + NL + color_def
+              if "supportsBrightness" not in dt:
+                  add_dd += NL + "public:" + NL + "  virtual bool supportsBrightness() { return false; }"
+              if add_dd:
+                  dt, n_dd = re.subn(r'(\b(?:class|struct)\s+DisplayDriver\b[^;{]*\{)', lambda m: m.group(1) + add_dd, dt, count=1)
+                  if n_dd:
+                      open(d_dd, "w").write(dt)
+                      print("DisplayDriver.h OK:", d_dd, color_def.strip())
+
+          # 3. CompanionNodePrefs: buscar el bloque con onboarding_state en _mishmesh y copiar sus campos
+          m_np_f = next((p for p in mish_h if "onboarding_state" in open(p, errors="ignore").read()), None)
+          d_np_f = next((p for p in all_h if re.search(r'\b(?:struct|class)\s+CompanionNodePrefs\b[^;{]*\{', open(p, errors="ignore").read())), None)
+          if not d_np_f:
+              d_np_f = next((p for p in all_h if re.search(r'\b(?:struct|class)\s+NodePrefs\b[^;{]*\{', open(p, errors="ignore").read())), None)
+          assert m_np_f and d_np_f, f"Falta prefs: {m_np_f} / {d_np_f}"
+
+          mt, dt = open(m_np_f, errors="ignore").read(), open(d_np_f, errors="ignore").read()
+          ob_pos = mt.find("onboarding_state")
+          open_b = mt.rfind("{", 0, ob_pos)
+          mb, _ = braced(mt, open_b)
+
+          ds = re.search(r'\b(?:struct|class)\s+(?:CompanionNodePrefs|NodePrefs)\b[^;{]*\{', dt)
+          db, de = braced(dt, ds.end() - 1)
+          seen = set(re.findall(r'\b([A-Za-z_]\w*)\b', db))
+          extra = []
+          for ln in mb[1:-1].splitlines():
+              c = re.sub(r'//.*', '', ln).strip()
+              if not c or c.startswith(('#', '/*', '*', 'public:', 'private:', 'protected:')) or '(' in c:
+                  continue
+              mf = re.search(r'\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?::\s*\d+\s*)?(?:=[^;]*)?;', c)
+              if mf and mf.group(1) not in seen:
+                  extra.append("  " + c)
+                  seen.add(mf.group(1))
+          if extra:
+              dt = dt[:de - 1] + NL + "public:" + NL + NL.join(extra) + NL + dt[de - 1:]
+              open(d_np_f, "w").write(dt)
+              print(f"CompanionNodePrefs OK ({len(extra)} campos) en {d_np_f}")
 
           # 4. MyMesh.h y MyMesh.cpp: friend UITask, includes y metodos faltantes
           mh_p, mc_p = "examples/companion_radio/MyMesh.h", "examples/companion_radio/MyMesh.cpp"
@@ -118,17 +139,17 @@ jobs:
           mmc = open("_mishmesh/examples/companion_radio/MyMesh.cpp", errors="ignore").read()
 
           if "typedef CompanionNodePrefs NodePrefs;" not in mh:
-              mh = re.sub(r'(class\s+MyMesh\b)', lambda m: "typedef CompanionNodePrefs NodePrefs;" + NL + "class UITask;" + NL + m.group(1), mh, count=1)
+              mh = re.sub(r'(\bclass\s+MyMesh\b[^;{]*\{)', lambda m: "typedef CompanionNodePrefs NodePrefs;" + NL + "class UITask;" + NL + m.group(1), mh, count=1)
           if "friend class UITask;" not in mh:
-              mh = re.sub(r'(class\s+MyMesh\b[^{]*\{)', lambda m: m.group(1) + NL + "  friend class UITask;" + NL, mh, count=1)
+              mh = re.sub(r'(\bclass\s+MyMesh\b[^;{]*\{)', lambda m: m.group(1) + NL + "  friend class UITask;" + NL, mh, count=1)
 
           decls = []
           if "getStore(" not in mh:
-              ms = re.search(r'\b(\w*Store)\s*\*\s*(\w+)\s*;', mh)
-              if ms: decls.append(f"  {ms.group(1)}* getStore() {{ return {ms.group(2)}; }}")
+              ms2 = re.search(r'\b(\w*Store)\s*\*\s*(\w+)\s*;', mh)
+              if ms2: decls.append(f"  {ms2.group(1)}* getStore() {{ return {ms2.group(2)}; }}")
           if "getNodePrefs(" not in mh:
-              mp = re.search(r'\b(?:CompanionNodePrefs|NodePrefs)\s+(\w+)\s*;', mh)
-              if mp: decls.append(f"  NodePrefs* getNodePrefs() {{ return &{mp.group(1)}; }}")
+              mp2 = re.search(r'\b(?:CompanionNodePrefs|NodePrefs)\s+(\w+)\s*;', mh)
+              if mp2: decls.append(f"  NodePrefs* getNodePrefs() {{ return &{mp2.group(1)}; }}")
           for m in re.finditer(r'^[ \t]*((?:virtual\s+|static\s+|inline\s+|const\s+)*[\w:*&<>\s]+?\b((?:ui[A-Z]|mishmesh)\w*)\s*\([^;{}]*\)\s*(?:const)?)\s*([;{])', mmh, flags=re.M):
               if re.search(rf'\b{m.group(2)}\s*\(', mh): continue
               if m.group(3) == ';': decls.append("  " + m.group(1).strip() + ";")
@@ -136,7 +157,7 @@ jobs:
                   blk, _ = braced(mmh, m.end() - 1)
                   decls.append("  " + m.group(1).strip() + " " + blk)
           if decls:
-              mh = re.sub(r'(class\s+MyMesh\b[^{]*\{)', lambda m: m.group(1) + NL + "public:" + NL + NL.join(decls) + NL, mh, count=1)
+              mh = re.sub(r'(\bclass\s+MyMesh\b[^;{]*\{)', lambda m: m.group(1) + NL + "public:" + NL + NL.join(decls) + NL, mh, count=1)
           open(mh_p, "w").write(mh)
 
           for inc in re.findall(r'^\s*#include\s+[<"](?:mishmesh|ed_?25519)[^">]*[>"]', mmc, flags=re.M):
@@ -163,10 +184,10 @@ jobs:
               bd = "{}" if rt == "void" else ("{ return false; }" if rt == "bool" else "{ return 0; }")
               add_abs.append(f"  virtual {vc} {bd}")
           if add_abs:
-              at = re.sub(r'(class\s+AbstractUITask\b[^{]*\{[\s\S]*?\bpublic\s*:)', lambda m: m.group(1) + NL + NL.join(add_abs), at, count=1)
+              at = re.sub(r'(\bclass\s+AbstractUITask\b[^;{]*\{[\s\S]*?\bpublic\s*:)', lambda m: m.group(1) + NL + NL.join(add_abs), at, count=1)
               open(abs_p, "w").write(at)
           if "_node_prefs" not in at and "_node_prefs" not in ut:
-              ut = re.sub(r'(class\s+UITask\b[^{]*\{)', lambda m: m.group(1) + NL + "protected:" + NL + "  NodePrefs* _node_prefs = nullptr;" + NL + "public:" + NL, ut, count=1)
+              ut = re.sub(r'(\bclass\s+UITask\b[^;{]*\{)', lambda m: m.group(1) + NL + "protected:" + NL + "  NodePrefs* _node_prefs = nullptr;" + NL + "public:" + NL, ut, count=1)
           ut = re.sub(r'\)\s*(const\s*)?\boverride\b', lambda m: ")" + (" " + m.group(1).strip() if m.group(1) else ""), ut)
           add_ov = []
           for pv in re.findall(r'virtual\s+([^{;=]+?\([^;]*\)\s*(?:const)?)\s*=\s*0\s*;', at):
@@ -177,7 +198,7 @@ jobs:
               bd = "{}" if rt == "void" else ("{ return false; }" if rt == "bool" else "{ return 0; }")
               add_ov.append(f"  {pc} {bd}")
           if add_ov:
-              ut = re.sub(r'(class\s+UITask\b[^{]*\{)', lambda m: m.group(1) + NL + "public:" + NL + NL.join(add_ov) + NL, ut, count=1)
+              ut = re.sub(r'(\bclass\s+UITask\b[^;{]*\{)', lambda m: m.group(1) + NL + "public:" + NL + NL.join(add_ov) + NL, ut, count=1)
           open(ui_p, "w").write(ut)
 
           # 6. main.cpp y platformio.ini
