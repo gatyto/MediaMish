@@ -9,22 +9,70 @@ jobs:
     steps:
       - name: Descargar base MediaMesh
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Descargar interfaz Mishmesh
-        run: git clone --depth 1 https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
+        run: git clone https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
 
       - name: Fusionar Mishmesh sobre MediaMesh
         run: |
           cp -r _mishmesh/mishmesh ./mishmesh
           cp -r _mishmesh/examples/companion_radio/ui-mishmesh ./examples/companion_radio/ui-mishmesh
+
+          git -C _mishmesh remote add upstream https://github.com/meshcore-dev/MeshCore.git
+          git -C _mishmesh fetch upstream --tags
+          git fetch ./_mishmesh HEAD
+
+          BASE=$(python3 - << 'EOF'
+          import subprocess
+          refs = subprocess.check_output(["git", "-C", "_mishmesh", "for-each-ref", "--format=%(refname)", "refs/remotes/upstream"]).decode().splitlines()
+          best_base, best_dist = None, 10**9
+          for r in refs:
+              try:
+                  mb = subprocess.check_output(["git", "-C", "_mishmesh", "merge-base", r, "HEAD"]).decode().strip()
+                  dist = int(subprocess.check_output(["git", "-C", "_mishmesh", "rev-list", "--count", f"{mb}..HEAD"]).decode().strip())
+                  if dist < best_dist:
+                      best_dist = dist
+                      best_base = mb
+              except Exception:
+                  pass
+          print(best_base)
+          EOF
+          )
+          echo "Base commit: $BASE"
+          git -C _mishmesh diff "$BASE" HEAD -- examples/companion_radio/ src/ > mishmesh_core.patch
+          git apply --3way mishmesh_core.patch || true
+
           python3 - << 'EOF'
           import glob, os, re
 
+          for path in glob.glob("examples/**/*", recursive=True) + glob.glob("src/**/*", recursive=True):
+              if os.path.isfile(path):
+                  txt = open(path, errors="ignore").read()
+                  if "<<<<<<<" in txt:
+                      print("Resolviendo conflicto en:", path)
+                      out, lines, i = [], txt.splitlines(keepends=True), 0
+                      while i < len(lines):
+                          if lines[i].startswith("<<<<<<<"):
+                              ours, theirs = [], []
+                              i += 1
+                              while i < len(lines) and not lines[i].startswith("======="):
+                                  ours.append(lines[i]); i += 1
+                              i += 1
+                              while i < len(lines) and not lines[i].startswith(">>>>>>>"):
+                                  theirs.append(lines[i]); i += 1
+                              i += 1
+                              out.extend(ours)
+                              for l in theirs:
+                                  if l not in ours or l.strip() in ("", "{", "}", "#endif"):
+                                      out.append(l)
+                          else:
+                              out.append(lines[i]); i += 1
+                      open(path, "w").writelines(out)
+
           def parse_sections(text):
-              sections = {}
-              order = []
-              cur = None
-              buf = []
+              sections, order, cur, buf = {}, [], None, []
               for line in text.splitlines(keepends=True):
                   m = re.match(r'^\[([^\]]+)\]\s*$', line)
                   if m:
@@ -41,33 +89,27 @@ jobs:
 
           src_ini = next((p for p in glob.glob("_mishmesh/**/platformio.ini", recursive=True)
                           if "WioTrackerL1_companion_radio_ble_mishmesh" in open(p).read()), None)
-          assert src_ini, "No se encontro platformio.ini en Mishmesh"
-
           rel = os.path.relpath(src_ini, "_mishmesh")
           dst_ini = rel if os.path.exists(rel) else next((p for p in glob.glob("**/platformio.ini", recursive=True)
                           if "WioTrackerL1_companion_radio_ble" in open(p).read()), None)
-          assert dst_ini, "No se encontro platformio.ini en MediaMesh"
 
           src_secs, src_order = parse_sections(open(src_ini).read())
           dst_secs, _ = parse_sections(open(dst_ini).read())
 
           to_add = [s for s in src_order if "mishmesh" in s.lower() and s not in dst_secs]
-
           added = True
           while added:
               added = False
               for s in list(to_add):
                   for line in src_secs[s].splitlines():
                       if line.strip().startswith("extends"):
-                          parents = [x.strip() for x in line.split("=", 1)[1].split(",")]
-                          for p in parents:
+                          for p in [x.strip() for x in line.split("=", 1)[1].split(",")]:
                               if p and p not in dst_secs and p not in to_add and p in src_secs:
                                   to_add.insert(0, p)
                                   added = True
 
           with open(dst_ini, "a") as f:
               for s in to_add:
-                  print("Agregando seccion:", s)
                   f.write("\n\n" + src_secs[s].strip() + "\n")
           EOF
 
