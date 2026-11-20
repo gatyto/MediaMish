@@ -1,0 +1,65 @@
+YAML
+name: Compilar Wio L1 Mishmesh + MediaMesh
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar base MediaMesh
+        uses: actions/checkout@v4
+
+      - name: Descargar interfaz Mishmesh
+        run: git clone --depth 1 https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
+
+      - name: Fusionar Mishmesh sobre MediaMesh
+        run: |
+          cp -r _mishmesh/mishmesh ./mishmesh
+          cp -r _mishmesh/examples/companion_radio/ui-mishmesh ./examples/companion_radio/ui-mishmesh
+          python3 - << 'EOF'
+          import glob, os
+
+          marker = "[env:WioTrackerL1_companion_radio_ble_mishmesh]"
+          src_file = next((p for p in glob.glob("_mishmesh/**/platformio.ini", recursive=True) if marker in open(p).read()), None)
+          assert src_file, "No se encontro el bloque mishmesh"
+
+          rel_path = os.path.relpath(src_file, "_mishmesh")
+          dst_file = rel_path if os.path.exists(rel_path) else next((p for p in glob.glob("**/platformio.ini", recursive=True) if "WioTrackerL1_companion_radio_ble" in open(p).read()), None)
+          assert dst_file, "No se encontro platformio.ini de Wio L1"
+
+          src = open(src_file).read()
+          dst = open(dst_file).read()
+
+          if marker not in dst:
+              part = src.split(marker, 1)[1]
+              next_env = part.find("\n[env:")
+              block = marker + (part[:next_env] if next_env != -1 else part)
+              with open(dst_file, "a") as f:
+                  f.write("\n\n" + block.strip() + "\n")
+          EOF
+
+      - name: Instalar PlatformIO
+        run: pip install -U platformio
+
+      - name: Compilar firmware para Wio Tracker L1
+        env:
+          FIRMWARE_VERSION: "mishmesh-mediamesh"
+        run: pio run -e WioTrackerL1_companion_radio_ble_mishmesh
+
+      - name: Generar archivo UF2
+        run: |
+          BUILD_DIR=".pio/build/WioTrackerL1_companion_radio_ble_mishmesh"
+          if [ -f "$BUILD_DIR/firmware.uf2" ]; then
+            cp "$BUILD_DIR/firmware.uf2" WioTrackerL1_mishmesh_mediamesh.uf2
+          else
+            UF2CONV=$(find ~/.platformio -name "uf2conv.py" | head -n 1)
+            python3 "$UF2CONV" "$BUILD_DIR/firmware.hex" -c -f 0xADA52840 -o WioTrackerL1_mishmesh_mediamesh.uf2
+          fi
+
+      - name: Subir UF2 para descarga
+        uses: actions/upload-artifact@v4
+        with:
+          name: WioTrackerL1-Mishmesh-MediaMesh
+          path: WioTrackerL1_mishmesh_mediamesh.uf2
