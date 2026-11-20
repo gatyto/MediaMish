@@ -11,152 +11,193 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Descargar interfaz Mishmesh
-        run: git clone https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
+        run: git clone --depth 1 https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
 
       - name: Fusionar Mishmesh sobre MediaMesh
         run: |
           cp -r _mishmesh/mishmesh ./mishmesh
           cp -r _mishmesh/examples/companion_radio/ui-mishmesh ./examples/companion_radio/ui-mishmesh
-
           python3 - << 'EOF'
-          import glob, os, re, subprocess
-
+          import glob, os, re
           NL = chr(10)
 
-          def extract_braced(text, open_brace_idx):
-              depth = 0
-              i = open_brace_idx
-              while i < len(text):
-                  if text[i] == '{':
-                      depth += 1
-                  elif text[i] == '}':
-                      depth -= 1
-                      if depth == 0:
-                          return text[open_brace_idx:i+1], i + 1
+          def braced(txt, idx):
+              d, i = 0, idx
+              while i < len(txt):
+                  if txt[i] == '{': d += 1
+                  elif txt[i] == '}':
+                      d -= 1
+                      if d == 0: return txt[idx:i+1], i + 1
                   i += 1
-              return text[open_brace_idx:], len(text)
+              return txt[idx:], len(txt)
 
-          # 1. Sincronizar DisplayDriver.h (Color + supportsBrightness)
-          mish_dd = next((p for p in glob.glob("_mishmesh/**/DisplayDriver.h", recursive=True)), None)
-          dst_dd = next((p for p in glob.glob("src/**/DisplayDriver.h", recursive=True)), None)
-          if dst_dd:
-              dd_txt = open(dst_dd, errors="ignore").read()
-              color_block = "  enum Color { BLACK = 0, WHITE = 1, INVERSE = 2 };"
-              if mish_dd:
-                  m_txt = open(mish_dd, errors="ignore").read()
-                  m_col = re.search(r'enum\s+Color\b[^{]*\{', m_txt)
-                  if m_col:
-                      blk, end_i = extract_braced(m_txt, m_col.end() - 1)
-                      color_block = "  " + m_txt[m_col.start():end_i] + ";"
-              inject_dd = ""
-              if "Color" not in dd_txt:
-                  inject_dd += NL + color_block
-              if "supportsBrightness" not in dd_txt:
-                  inject_dd += NL + "  virtual bool supportsBrightness() { return false; }"
-              if inject_dd:
-                  dd_txt = re.sub(
-                      r'(class\s+DisplayDriver\b[^{]*\{[\s\S]*?\bpublic\s*:)',
-                      lambda m: m.group(1) + inject_dd,
-                      dd_txt,
-                      count=1
-                  )
-                  open(dst_dd, "w").write(dd_txt)
-                  print("Actualizado DisplayDriver.h:", dst_dd)
+          # 1. DisplayDriver.h: Color + supportsBrightness
+          for p in glob.glob("src/**/DisplayDriver.h", recursive=True):
+              t = open(p, errors="ignore").read()
+              add = ""
+              if "Color" not in t:
+                  add += NL + "  enum Color { BLACK = 0, WHITE = 1, INVERSE = 2 };"
+              if "supportsBrightness" not in t:
+                  add += NL + "  virtual bool supportsBrightness() { return false; }"
+              if add:
+                  t = re.sub(r'(class\s+DisplayDriver\b[^{]*\{[\s\S]*?\bpublic\s*:)', lambda m: m.group(1) + add, t, count=1)
+                  open(p, "w").write(t)
 
-          # 2. Copiar campos faltantes de NodePrefs -> CompanionNodePrefs
-          mish_np_file = next((p for p in glob.glob("_mishmesh/**/*.h", recursive=True)
-                               if re.search(r'\bstruct\s+NodePrefs\b', open(p, errors="ignore").read())), None)
-          dst_np_file = next((p for p in glob.glob("examples/**/*.h", recursive=True) + glob.glob("src/**/*.h", recursive=True)
-                              if re.search(r'\bstruct\s+CompanionNodePrefs\b', open(p, errors="ignore").read())), None)
+          # 2. CompanionNodePrefs: agregar campos de NodePrefs de Mishmesh
+          m_np_f = next((p for p in glob.glob("_mishmesh/**/*.h", recursive=True) if "struct NodePrefs" in open(p, errors="ignore").read()), None)
+          d_np_f = next((p for p in glob.glob("examples/**/*.h", recursive=True) + glob.glob("src/**/*.h", recursive=True) if "struct CompanionNodePrefs" in open(p, errors="ignore").read()), None)
+          if m_np_f and d_np_f:
+              mt, dt = open(m_np_f, errors="ignore").read(), open(d_np_f, errors="ignore").read()
+              ms, ds = re.search(r'\bstruct\s+NodePrefs\b[^{]*\{', mt), re.search(r'\bstruct\s+CompanionNodePrefs\b[^{]*\{', dt)
+              if ms and ds:
+                  mb, _ = braced(mt, ms.end() - 1)
+                  db, de = braced(dt, ds.end() - 1)
+                  seen = set(re.findall(r'\b([A-Za-z_]\w*)\b', db))
+                  extra = []
+                  for ln in mb[1:-1].splitlines():
+                      c = re.sub(r'//.*', '', ln).strip()
+                      if not c or c.startswith(('#', '/*', '*')): continue
+                      mf = re.search(r'\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;', c)
+                      if mf and mf.group(1) not in seen:
+                          extra.append("  " + c)
+                          seen.add(mf.group(1))
+                  if extra:
+                      dt = dt[:de - 1] + NL + NL.join(extra) + NL + dt[de - 1:]
+                      open(d_np_f, "w").write(dt)
 
-          if mish_np_file and dst_np_file:
-              m_np = open(mish_np_file, errors="ignore").read()
-              d_np = open(dst_np_file, errors="ignore").read()
-              m_st = re.search(r'\bstruct\s+NodePrefs\b[^{]*\{', m_np)
-              d_st = re.search(r'\bstruct\s+CompanionNodePrefs\b[^{]*\{', d_np)
-              if m_st and d_st:
-                  m_body, _ = extract_braced(m_np, m_st.end() - 1)
-                  d_body, d_end = extract_braced(d_np, d_st.end() - 1)
-                  existing_ids = set(re.findall(r'\b([A-Za-z_]\w*)\b', d_body))
-                  missing_lines = []
-                  for raw_line in m_body[1:-1].splitlines():
-                      clean = re.sub(r'//.*', '', raw_line).strip()
-                      if not clean or clean.startswith(('#', '/*', '*')):
-                          continue
-                      m_field = re.search(r'\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;', clean)
-                      if m_field:
-                          fname = m_field.group(1)
-                          if fname not in existing_ids:
-                              missing_lines.append("  " + clean)
-                              existing_ids.add(fname)
-                  if missing_lines:
-                      d_np = d_np[:d_end - 1] + NL + "  // Campos Mishmesh" + NL + NL.join(missing_lines) + NL + d_np[d_end - 1:]
-                      open(dst_np_file, "w").write(d_np)
-                      print("Agregados campos a CompanionNodePrefs:", len(missing_lines))
+          # 3. MyMesh.h y MyMesh.cpp: friend UITask + metodos ui* y mishmesh*
+          mh_p, mc_p = "examples/companion_radio/MyMesh.h", "examples/companion_radio/MyMesh.cpp"
+          mh, mc = open(mh_p, errors="ignore").read(), open(mc_p, errors="ignore").read()
+          mmh = open("_mishmesh/examples/companion_radio/MyMesh.h", errors="ignore").read()
+          mmc = open("_mishmesh/examples/companion_radio/MyMesh.cpp", errors="ignore").read()
 
-          # 3. Aplicar diff de Mishmesh en MyMesh.h y MyMesh.cpp
-          first_mish = subprocess.check_output(
-              ["git", "-C", "_mishmesh", "log", "--reverse", "--format=%H", "--", "mishmesh", "examples/companion_radio/ui-mishmesh"]
-          ).decode().splitlines()[0].strip()
-          base_commit = f"{first_mish}~1"
+          if "typedef CompanionNodePrefs NodePrefs;" not in mh:
+              mh = re.sub(r'(class\s+MyMesh\b)', lambda m: "typedef CompanionNodePrefs NodePrefs;" + NL + "class UITask;" + NL + m.group(1), mh, count=1)
+          if "friend class UITask;" not in mh:
+              mh = re.sub(r'(class\s+MyMesh\b[^{]*\{)', lambda m: m.group(1) + NL + "  friend class UITask;" + NL, mh, count=1)
 
-          for f in ["examples/companion_radio/MyMesh.h", "examples/companion_radio/MyMesh.cpp"]:
-              diff_txt = subprocess.check_output(
-                  ["git", "-C", "_mishmesh", "diff", "-U3", base_commit, "HEAD", "--", f]
-              ).decode(errors="ignore")
-              if not diff_txt.strip():
-                  continue
-              dst_lines = open(f, errors="ignore").read().splitlines(keepends=True)
-              hunks, cur = [], []
-              for line in diff_txt.splitlines(keepends=True):
-                  if line.startswith("@@ "):
-                      if cur:
-                          hunks.append(cur)
-                      cur = []
-                  elif line.startswith(("diff ", "index ", "--- ", "+++ ")):
-                      continue
-                  elif line.startswith((" ", "+", "-")):
-                      cur.append(line)
-              if cur:
-                  hunks.append(cur)
+          decls = []
+          if "getStore(" not in mh:
+              ms = re.search(r'\b(\w*Store)\s*\*\s*(\w+)\s*;', mh)
+              if ms: decls.append(f"  {ms.group(1)}* getStore() {{ return {ms.group(2)}; }}")
+          if "getNodePrefs(" not in mh:
+              mp = re.search(r'\b(?:CompanionNodePrefs|NodePrefs)\s+(\w+)\s*;', mh)
+              if mp: decls.append(f"  NodePrefs* getNodePrefs() {{ return &{mp.group(1)}; }}")
 
-              for h in hunks:
-                  old_seq = [l[1:] for l in h if l.startswith((" ", "-"))]
-                  new_seq = [l[1:] for l in h if l.startswith((" ", "+"))]
-                  added_only = [l[1:] for l in h if l.startswith("+")]
-                  if not added_only or all(a in dst_lines for a in added_only if a.strip()):
-                      continue
-                  pos = next((i for i in range(len(dst_lines) - len(old_seq) + 1) if dst_lines[i:i+len(old_seq)] == old_seq), -1)
-                  if pos != -1:
-                      dst_lines = dst_lines[:pos] + new_seq + dst_lines[pos+len(old_seq):]
-                      continue
-                  before_ctx, after_ctx, seen = [], [], False
-                  for l in h:
-                      if l.startswith(("+", "-")):
-                          seen = True
-                          after_ctx = []
-                      elif l.startswith(" "):
-                          (after_ctx if seen else before_ctx).append(l[1:])
-                  if before_ctx:
-                      matches = [i for i in range(len(dst_lines) - len(before_ctx) + 1) if dst_lines[i:i+len(before_ctx)] == before_ctx]
-                      if len(matches) == 1:
-                          ins = matches[0] + len(before_ctx)
-                          dst_lines = dst_lines[:ins] + added_only + dst_lines[ins:]
-                          continue
-                  if after_ctx:
-                      matches = [i for i in range(len(dst_lines) - len(after_ctx) + 1) if dst_lines[i:i+len(after_ctx)] == after_ctx]
-                      if len(matches) == 1:
-                          dst_lines = dst_lines[:matches[0]] + added_only + dst_lines[matches[0]:]
-              open(f, "w").writelines(dst_lines)
+          for m in re.finditer(r'^[ \t]*((?:virtual\s+|static\s+|inline\s+|const\s+)*[\w:*&<>\s]+?\b((?:ui[A-Z]|mishmesh)\w*)\s*\([^;{}]*\)\s*(?:const)?)\s*([;{])', mmh, flags=re.M):
+              if re.search(rf'\b{m.group(2)}\s*\(', mh): continue
+              if m.group(3) == ';': decls.append("  " + m.group(1).strip() + ";")
+              else:
+                  blk, _ = braced(mmh, m.end() - 1)
+                  decls.append("  " + m.group(1).strip() + " " + blk)
+          if decls:
+              mh = re.sub(r'(class\s+MyMesh\b[^{]*\{)', lambda m: m.group(1) + NL + "public:" + NL + NL.join(decls) + NL, mh, count=1)
+          open(mh_p, "w").write(mh)
 
-          # 4. Dar acceso friend class UITask a MyMesh y copiar metodos ui* / mishmesh*
-          mymesh_h_path = "examples/companion_radio/MyMesh.h"
-          mymesh_cpp_path = "examples/companion_radio/MyMesh.cpp"
-          mh = open(mymesh_h_path, errors="ignore").read()
-          mc = open(mymesh_cpp_path, errors="ignore").read()
-          mish_mh = open("_mishmesh/examples/companion_radio/MyMesh.h", errors="ignore").read()
-          mish_mc = open("_mishmesh/examples/companion_radio/MyMesh.cpp", errors="ignore").read()
+          defs = []
+          for m in re.finditer(r'^([^\n;{}]*\bMyMesh::((?:ui[A-Z]|mishmesh)\w*)\s*\([^{;]*\)\s*(?:const)?\s*)\{', mmc, flags=re.M):
+              if re.search(rf'\bMyMesh::{m.group(2)}\s*\(', mc): continue
+              blk, _ = braced(mmc, m.end() - 1)
+              defs.append(m.group(1) + blk)
+          if defs:
+              open(mc_p, "w").write(mc + NL + (NL + NL).join(defs) + NL)
 
-          if "CompanionNodePrefs" in mh and "typedef CompanionNodePrefs NodePrefs;" not in mh:
-              mh = re.sub(
-                  r'(class\s+MyMesh\b)',
+          # 4. AbstractUITask.h y ui-mishmesh/UITask.h
+          abs_p, ui_p = "examples/companion_radio/AbstractUITask.h", "examples/companion_radio/ui-mishmesh/UITask.h"
+          at, ut = open(abs_p, errors="ignore").read(), open(ui_p, errors="ignore").read()
+          mat = open("_mishmesh/examples/companion_radio/AbstractUITask.h", errors="ignore").read()
+
+          add_abs = []
+          for mv in re.findall(r'virtual\s+([^{;=]+?\([^;]*\)\s*(?:const)?)\s*(?:=\s*0\s*;|\{[^}]*\})', mat):
+              vc = " ".join(mv.split())
+              mn = re.search(r'\b(\w+)\s*\(', vc)
+              if not mn or mn.group(1).startswith('~') or re.search(rf'\b{mn.group(1)}\s*\(', at): continue
+              rt = vc[:mn.start()].strip()
+              bd = "{}" if rt == "void" else ("{ return false; }" if rt == "bool" else "{ return 0; }")
+              add_abs.append(f"  virtual {vc} {bd}")
+          if add_abs:
+              at = re.sub(r'(class\s+AbstractUITask\b[^{]*\{[\s\S]*?\bpublic\s*:)', lambda m: m.group(1) + NL + NL.join(add_abs), at, count=1)
+              open(abs_p, "w").write(at)
+
+          if "_node_prefs" not in at and "_node_prefs" not in ut:
+              ut = re.sub(r'(class\s+UITask\b[^{]*\{)', lambda m: m.group(1) + NL + "protected:" + NL + "  NodePrefs* _node_prefs = nullptr;" + NL + "public:" + NL, ut, count=1)
+          ut = re.sub(r'\)\s*(const\s*)?\boverride\b', lambda m: ")" + (" " + m.group(1).strip() if m.group(1) else ""), ut)
+          add_ov = []
+          for pv in re.findall(r'virtual\s+([^{;=]+?\([^;]*\)\s*(?:const)?)\s*=\s*0\s*;', at):
+              pc = " ".join(pv.split())
+              mn = re.search(r'\b(\w+)\s*\(', pc)
+              if not mn or re.search(rf'\b{mn.group(1)}\s*\(', ut): continue
+              rt = pc[:mn.start()].strip()
+              bd = "{}" if rt == "void" else ("{ return false; }" if rt == "bool" else "{ return 0; }")
+              add_ov.append(f"  {pc} {bd}")
+          if add_ov:
+              ut = re.sub(r'(class\s+UITask\b[^{]*\{)', lambda m: m.group(1) + NL + "public:" + NL + NL.join(add_ov) + NL, ut, count=1)
+          open(ui_p, "w").write(ut)
+
+          # 5. main.cpp y platformio.ini
+          mp = "examples/companion_radio/main.cpp"
+          mt2 = open(mp, errors="ignore").read()
+          mm2 = open("_mishmesh/examples/companion_radio/main.cpp", errors="ignore").read()
+          if "ui-mishmesh/UITask.h" not in mt2:
+              mt2 = re.sub(r'(#include\s+"ui-[^"]+/UITask\.h")', lambda m: "#ifdef UI_MISHMESH" + NL + '#include "ui-mishmesh/UITask.h"' + NL + "#else" + NL + m.group(1) + NL + "#endif", mt2, count=1)
+              mi = re.search(r'^\s*(UITask\s+ui_task\b[^;]*;)', mm2, flags=re.M)
+              if mi:
+                  mt2 = re.sub(r'^(\s*)(UITask\s+ui_task\b[^;]*;)', lambda m: "#ifdef UI_MISHMESH" + NL + m.group(1) + mi.group(1).strip() + NL + "#else" + NL + m.group(1) + m.group(2) + NL + "#endif", mt2, count=1, flags=re.M)
+              open(mp, "w").write(mt2)
+
+          def secs(t):
+              s, o, c, b = {}, [], None, []
+              for ln in t.splitlines(keepends=True):
+                  m = re.match(r'^\[([^\]]+)\]\s*$', ln)
+                  if m:
+                      if c: s[c] = "".join(b)
+                      c = m.group(1).strip(); o.append(c); b = [ln]
+                  elif c: b.append(ln)
+              if c: s[c] = "".join(b)
+              return s, o
+
+          si = next(p for p in glob.glob("_mishmesh/**/platformio.ini", recursive=True) if "WioTrackerL1_companion_radio_ble_mishmesh" in open(p).read())
+          rel = os.path.relpath(si, "_mishmesh")
+          di = rel if os.path.exists(rel) else next(p for p in glob.glob("**/platformio.ini", recursive=True) if "WioTrackerL1_companion_radio_ble" in open(p).read())
+          ss, so = secs(open(si).read())
+          ds2, _ = secs(open(di).read())
+          add_s = [x for x in so if "mishmesh" in x.lower() and x not in ds2]
+          chg = True
+          while chg:
+              chg = False
+              for x in list(add_s):
+                  for ln in ss[x].splitlines():
+                      if ln.strip().startswith("extends"):
+                          for p in [v.strip() for v in ln.split("=", 1)[1].split(",")]:
+                              if p and p not in ds2 and p not in add_s and p in ss:
+                                  add_s.insert(0, p); chg = True
+          with open(di, "a") as f:
+              for x in add_s:
+                  f.write(NL + NL + ss[x].strip() + (NL + "  -D UI_MISHMESH=1" if x == "env:WioTrackerL1_companion_radio_ble_mishmesh" else "") + NL)
+          print("Fusion completada OK")
+          EOF
+
+      - name: Instalar PlatformIO
+        run: pip install -U platformio
+
+      - name: Compilar firmware para Wio Tracker L1
+        env:
+          FIRMWARE_VERSION: "mishmesh-mediamesh"
+        run: pio run -e WioTrackerL1_companion_radio_ble_mishmesh
+
+      - name: Generar archivo UF2
+        run: |
+          BUILD_DIR=".pio/build/WioTrackerL1_companion_radio_ble_mishmesh"
+          if [ -f "$BUILD_DIR/firmware.uf2" ]; then
+            cp "$BUILD_DIR/firmware.uf2" WioTrackerL1_mishmesh_mediamesh.uf2
+          else
+            UF2CONV=$(find ~/.platformio -name "uf2conv.py" | head -n 1)
+            python3 "$UF2CONV" "$BUILD_DIR/firmware.hex" -c -f 0xADA52840 -o WioTrackerL1_mishmesh_mediamesh.uf2
+          fi
+
+      - name: Subir UF2 para descarga
+        uses: actions/upload-artifact@v4
+        with:
+          name: WioTrackerL1-Mishmesh-MediaMesh
+          path: WioTrackerL1_mishmesh_mediamesh.uf2
+# FIN DEL ARCHIVO
