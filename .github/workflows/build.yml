@@ -1,4 +1,3 @@
-YAML
 name: Compilar Wio L1 Mishmesh + MediaMesh
 
 on:
