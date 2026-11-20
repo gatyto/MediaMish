@@ -11,7 +11,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Descargar interfaz Mishmesh
-        run: git clone --depth 1 https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
+        run: git clone https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
 
       - name: Fusionar Mishmesh sobre MediaMesh
         run: |
@@ -126,6 +126,8 @@ jobs:
           m_body, _ = braced(mmh, m_cls.end() - 1)
           decls = []
           if "friend class UITask;" not in mh: decls.append("  friend class UITask;")
+          if "_identity_fresh" in mh and not re.search(r'\bbool\s+_identity_fresh\b', mh):
+              decls.append("  bool _identity_fresh = false;")
           if "getStore(" not in mh:
               ms2 = re.search(r'\b(\w*Store)\s*\*\s*(\w+)\s*;', mh)
               if ms2: decls.append(f"  {ms2.group(1)}* getStore() {{ return {ms2.group(2)}; }}")
@@ -151,7 +153,6 @@ jobs:
                       if sym not in ('MyMesh', 'void', 'bool', 'int', 'uint8_t', 'uint16_t', 'uint32_t', 'const', 'static', 'virtual') and not re.search(rf'\b{sym}\b', mh):
                           decls.append(full_s)
 
-          # Garantizar declaracion en MyMesh.h para cada MyMesh::metodo copiado de MyMesh.cpp
           defs = []
           for m in re.finditer(r'^([^\n;{}]*\bMyMesh::([A-Za-z_]\w*)\s*\([^{;]*\)\s*(?:const)?\s*)\{', mmc, flags=re.M):
               fn_name = m.group(2)
@@ -188,21 +189,40 @@ jobs:
               elif not ln.startswith(("diff ", "index ", "--- ", "+++ ")) and ln.startswith((" ", "+", "-")):
                   cur.append(ln)
           if cur: hunks.append(cur)
+
+          hooks_ok = 0
           for h in hunks:
               add_s = [l[1:] for l in h if l.startswith("+")]
               if not add_s or any("MyMesh::" in l for l in add_s): continue
+              if all(a in dst_lines for a in add_s if a.strip()): continue
               old_s = [l[1:] for l in h if l.startswith((" ", "-"))]
               new_s = [l[1:] for l in h if l.startswith((" ", "+"))]
+              cand = None
               matches = [i for i in range(len(dst_lines) - len(old_s) + 1) if dst_lines[i:i+len(old_s)] == old_s]
               if len(matches) == 1:
                   cand = dst_lines[:matches[0]] + new_s + dst_lines[matches[0]+len(old_s):]
+              else:
+                  bef, aft, seen_c = [], [], False
+                  for l in h:
+                      if l.startswith(("+", "-")): seen_c = True; aft = []
+                      elif l.startswith(" "): (aft if seen_c else bef).append(l[1:])
+                  if bef:
+                      m_b = [i for i in range(len(dst_lines) - len(bef) + 1) if dst_lines[i:i+len(bef)] == bef]
+                      if len(m_b) == 1:
+                          cand = dst_lines[:m_b[0]+len(bef)] + add_s + dst_lines[m_b[0]+len(bef):]
+                  if cand is None and aft:
+                      m_a = [i for i in range(len(dst_lines) - len(aft) + 1) if dst_lines[i:i+len(aft)] == aft]
+                      if len(m_a) == 1:
+                          cand = dst_lines[:m_a[0]] + add_s + dst_lines[m_a[0]:]
+              if cand is not None:
                   joined = "".join(cand)
                   if joined.count('{') == joined.count('}'):
                       dst_lines = cand
+                      hooks_ok += 1
           mc = "".join(dst_lines)
           if defs:
               mc = mc + NL + (NL + NL).join(defs) + NL
-              print(f"MyMesh.cpp OK ({len(defs)} metodos)")
+          print(f"MyMesh.cpp OK ({hooks_ok} hooks, {len(defs)} metodos)")
           open(mc_p, "w").write(mc)
 
           # 4. AbstractUITask.h y ui-mishmesh/UITask.h
