@@ -18,54 +18,109 @@ jobs:
           cp -r _mishmesh/mishmesh ./mishmesh
           cp -r _mishmesh/examples/companion_radio/ui-mishmesh ./examples/companion_radio/ui-mishmesh
 
-          FIRST_MISH=$(git -C _mishmesh log --reverse --format=%H -- mishmesh examples/companion_radio/ui-mishmesh | head -n 1)
-          BASE_COMMIT="${FIRST_MISH}~1"
-          echo "Commit base de Mishmesh: $BASE_COMMIT"
-
-          for f in $(git -C _mishmesh diff --name-only "$BASE_COMMIT" HEAD -- examples/companion_radio/ src/); do
-            if [ -f "_mishmesh/$f" ]; then
-              if [ -f "$f" ] && git -C _mishmesh cat-file -e "$BASE_COMMIT:$f" 2>/dev/null; then
-                echo "Fusionando: $f"
-                git -C _mishmesh show "$BASE_COMMIT:$f" > /tmp/base_file
-                git merge-file "$f" /tmp/base_file "_mishmesh/$f" || true
-              elif [ ! -f "$f" ]; then
-                echo "Copiando nuevo: $f"
-                mkdir -p "$(dirname "$f")"
-                cp "_mishmesh/$f" "$f"
-              fi
-            fi
-          done
-
           python3 - << 'EOF'
-          import glob, os, re
+          import glob, os, re, subprocess
 
-          for path in glob.glob("examples/**/*", recursive=True) + glob.glob("src/**/*", recursive=True):
-              if os.path.isfile(path):
-                  txt = open(path, errors="ignore").read()
-                  if "<<<<<<<" in txt:
-                      print("Resolviendo conflicto en:", path)
-                      out, lines, i = [], txt.splitlines(keepends=True), 0
-                      while i < len(lines):
-                          if lines[i].startswith("<<<<<<<"):
-                              ours, theirs = [], []
-                              i += 1
-                              while i < len(lines) and not lines[i].startswith("======="):
-                                  ours.append(lines[i]); i += 1
-                              i += 1
-                              while i < len(lines) and not lines[i].startswith(">>>>>>>"):
-                                  theirs.append(lines[i]); i += 1
-                              i += 1
-                              out.extend(ours)
-                              for l in theirs:
-                                  if l not in ours or l.strip() in ("", "{", "}", "#endif", "#else", "break;", "return;"):
-                                      out.append(l)
+          first_mish = subprocess.check_output(
+              ["git", "-C", "_mishmesh", "log", "--reverse", "--format=%H", "--", "mishmesh", "examples/companion_radio/ui-mishmesh"]
+          ).decode().splitlines()[0].strip()
+          base_commit = f"{first_mish}~1"
+          print("Base commit:", base_commit)
+
+          target_files = [
+              "examples/companion_radio/MyMesh.h",
+              "examples/companion_radio/MyMesh.cpp",
+              "examples/companion_radio/main.cpp",
+          ]
+
+          for f in target_files:
+              diff_txt = subprocess.check_output(
+                  ["git", "-C", "_mishmesh", "diff", "-U3", base_commit, "HEAD", "--", f]
+              ).decode(errors="ignore")
+              if not diff_txt.strip():
+                  continue
+              print(f"\n=== Procesando {f} ===")
+              dst_lines = open(f, errors="ignore").read().splitlines(keepends=True)
+
+              hunks, cur = [], []
+              for line in diff_txt.splitlines(keepends=True):
+                  if line.startswith("@@ "):
+                      if cur:
+                          hunks.append(cur)
+                      cur = []
+                  elif line.startswith(("diff ", "index ", "--- ", "+++ ")):
+                      continue
+                  elif line.startswith((" ", "+", "-")):
+                      cur.append(line)
+              if cur:
+                  hunks.append(cur)
+
+              for idx, h in enumerate(hunks, 1):
+                  old_seq = [l[1:] for l in h if l.startswith((" ", "-"))]
+                  new_seq = [l[1:] for l in h if l.startswith((" ", "+"))]
+                  added_only = [l[1:] for l in h if l.startswith("+")]
+                  if not added_only:
+                      continue
+
+                  if all(a in dst_lines for a in added_only if a.strip()):
+                      print(f"  Hunk {idx}: ya estaba aplicado")
+                      continue
+
+                  pos = -1
+                  for i in range(len(dst_lines) - len(old_seq) + 1):
+                      if dst_lines[i:i+len(old_seq)] == old_seq:
+                          pos = i
+                          break
+                  if pos != -1:
+                      dst_lines = dst_lines[:pos] + new_seq + dst_lines[pos+len(old_seq):]
+                      print(f"  Hunk {idx}: aplicado por coincidencia exacta")
+                      continue
+
+                  before_ctx, after_ctx, seen_change = [], [], False
+                  for l in h:
+                      if l.startswith(("+", "-")):
+                          seen_change = True
+                          after_ctx = []
+                      elif l.startswith(" "):
+                          if not seen_change:
+                              before_ctx.append(l[1:])
                           else:
-                              out.append(lines[i]); i += 1
-                      open(path, "w").writelines(out)
+                              after_ctx.append(l[1:])
 
-          mymesh_h = open("examples/companion_radio/MyMesh.h", errors="ignore").read()
-          assert "mishmeshSendText" in mymesh_h, "Error: MyMesh.h no recibio los metodos de Mishmesh"
-          print("Verificacion OK: MyMesh.h incluye Mishmesh")
+                  inserted = False
+                  if before_ctx and after_ctx:
+                      for i in range(len(dst_lines) - len(before_ctx) + 1):
+                          if dst_lines[i:i+len(before_ctx)] == before_ctx:
+                              for j in range(i + len(before_ctx), min(len(dst_lines) - len(after_ctx) + 1, i + len(before_ctx) + 40)):
+                                  if dst_lines[j:j+len(after_ctx)] == after_ctx:
+                                      dst_lines = dst_lines[:j] + added_only + dst_lines[j:]
+                                      print(f"  Hunk {idx}: insertado antes de contexto posterior")
+                                      inserted = True
+                                      break
+                              if inserted:
+                                  break
+
+                  if not inserted and before_ctx:
+                      matches = [i for i in range(len(dst_lines) - len(before_ctx) + 1) if dst_lines[i:i+len(before_ctx)] == before_ctx]
+                      if len(matches) == 1:
+                          ins_at = matches[0] + len(before_ctx)
+                          dst_lines = dst_lines[:ins_at] + added_only + dst_lines[ins_at:]
+                          print(f"  Hunk {idx}: insertado despues de contexto anterior")
+                          inserted = True
+
+                  if not inserted and after_ctx:
+                      matches = [i for i in range(len(dst_lines) - len(after_ctx) + 1) if dst_lines[i:i+len(after_ctx)] == after_ctx]
+                      if len(matches) == 1:
+                          ins_at = matches[0]
+                          dst_lines = dst_lines[:ins_at] + added_only + dst_lines[ins_at:]
+                          print(f"  Hunk {idx}: insertado antes de contexto posterior unico")
+                          inserted = True
+
+                  if not inserted:
+                      print(f"  AVISO Hunk {idx} no pudo ubicarse:")
+                      print("".join(h))
+
+              open(f, "w").writelines(dst_lines)
 
           def parse_sections(text):
               sections, order, cur, buf = {}, [], None, []
