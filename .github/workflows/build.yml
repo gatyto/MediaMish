@@ -21,121 +21,178 @@ jobs:
           python3 - << 'EOF'
           import glob, os, re, subprocess
 
+          # 1. Agregar supportsBrightness() a DisplayDriver si falta
+          for p in glob.glob("src/**/*DisplayDriver*.h", recursive=True):
+              txt = open(p, errors="ignore").read()
+              if "class DisplayDriver" in txt and "supportsBrightness" not in txt:
+                  txt = re.sub(
+                      r'(class\s+DisplayDriver\b[^{]*\{[\s\S]*?\bpublic\s*:)',
+                      r'\1\n  virtual bool supportsBrightness() { return false; }',
+                      txt,
+                      count=1
+                  )
+                  open(p, "w").write(txt)
+                  print("Agregado supportsBrightness() en:", p)
+
+          # 2. Aplicar cambios de Mishmesh SOLO a MyMesh.h y MyMesh.cpp (no a main.cpp)
           first_mish = subprocess.check_output(
               ["git", "-C", "_mishmesh", "log", "--reverse", "--format=%H", "--", "mishmesh", "examples/companion_radio/ui-mishmesh"]
           ).decode().splitlines()[0].strip()
           base_commit = f"{first_mish}~1"
-          print("Base commit:", base_commit)
 
-          target_files = [
-              "examples/companion_radio/MyMesh.h",
-              "examples/companion_radio/MyMesh.cpp",
-              "examples/companion_radio/main.cpp",
-          ]
-
-          for f in target_files:
+          for f in ["examples/companion_radio/MyMesh.h", "examples/companion_radio/MyMesh.cpp"]:
               diff_txt = subprocess.check_output(
                   ["git", "-C", "_mishmesh", "diff", "-U3", base_commit, "HEAD", "--", f]
               ).decode(errors="ignore")
               if not diff_txt.strip():
                   continue
-              print(f"\n=== Procesando {f} ===")
               dst_lines = open(f, errors="ignore").read().splitlines(keepends=True)
-
               hunks, cur = [], []
               for line in diff_txt.splitlines(keepends=True):
                   if line.startswith("@@ "):
-                      if cur:
-                          hunks.append(cur)
+                      if cur: hunks.append(cur)
                       cur = []
                   elif line.startswith(("diff ", "index ", "--- ", "+++ ")):
                       continue
                   elif line.startswith((" ", "+", "-")):
                       cur.append(line)
-              if cur:
-                  hunks.append(cur)
+              if cur: hunks.append(cur)
 
-              for idx, h in enumerate(hunks, 1):
+              for h in hunks:
                   old_seq = [l[1:] for l in h if l.startswith((" ", "-"))]
                   new_seq = [l[1:] for l in h if l.startswith((" ", "+"))]
                   added_only = [l[1:] for l in h if l.startswith("+")]
-                  if not added_only:
+                  if not added_only or all(a in dst_lines for a in added_only if a.strip()):
                       continue
-
-                  if all(a in dst_lines for a in added_only if a.strip()):
-                      print(f"  Hunk {idx}: ya estaba aplicado")
-                      continue
-
-                  pos = -1
-                  for i in range(len(dst_lines) - len(old_seq) + 1):
-                      if dst_lines[i:i+len(old_seq)] == old_seq:
-                          pos = i
-                          break
+                  pos = next((i for i in range(len(dst_lines) - len(old_seq) + 1) if dst_lines[i:i+len(old_seq)] == old_seq), -1)
                   if pos != -1:
                       dst_lines = dst_lines[:pos] + new_seq + dst_lines[pos+len(old_seq):]
-                      print(f"  Hunk {idx}: aplicado por coincidencia exacta")
                       continue
-
-                  before_ctx, after_ctx, seen_change = [], [], False
+                  before_ctx, after_ctx, seen = [], [], False
                   for l in h:
                       if l.startswith(("+", "-")):
-                          seen_change = True
-                          after_ctx = []
+                          seen = True; after_ctx = []
                       elif l.startswith(" "):
-                          if not seen_change:
-                              before_ctx.append(l[1:])
-                          else:
-                              after_ctx.append(l[1:])
-
-                  inserted = False
-                  if before_ctx and after_ctx:
-                      for i in range(len(dst_lines) - len(before_ctx) + 1):
-                          if dst_lines[i:i+len(before_ctx)] == before_ctx:
-                              for j in range(i + len(before_ctx), min(len(dst_lines) - len(after_ctx) + 1, i + len(before_ctx) + 40)):
-                                  if dst_lines[j:j+len(after_ctx)] == after_ctx:
-                                      dst_lines = dst_lines[:j] + added_only + dst_lines[j:]
-                                      print(f"  Hunk {idx}: insertado antes de contexto posterior")
-                                      inserted = True
-                                      break
-                              if inserted:
-                                  break
-
-                  if not inserted and before_ctx:
+                          (after_ctx if seen else before_ctx).append(l[1:])
+                  if before_ctx:
                       matches = [i for i in range(len(dst_lines) - len(before_ctx) + 1) if dst_lines[i:i+len(before_ctx)] == before_ctx]
                       if len(matches) == 1:
-                          ins_at = matches[0] + len(before_ctx)
-                          dst_lines = dst_lines[:ins_at] + added_only + dst_lines[ins_at:]
-                          print(f"  Hunk {idx}: insertado despues de contexto anterior")
-                          inserted = True
-
-                  if not inserted and after_ctx:
+                          ins = matches[0] + len(before_ctx)
+                          dst_lines = dst_lines[:ins] + added_only + dst_lines[ins:]
+                          continue
+                  if after_ctx:
                       matches = [i for i in range(len(dst_lines) - len(after_ctx) + 1) if dst_lines[i:i+len(after_ctx)] == after_ctx]
                       if len(matches) == 1:
-                          ins_at = matches[0]
-                          dst_lines = dst_lines[:ins_at] + added_only + dst_lines[ins_at:]
-                          print(f"  Hunk {idx}: insertado antes de contexto posterior unico")
-                          inserted = True
-
-                  if not inserted:
-                      print(f"  AVISO Hunk {idx} no pudo ubicarse:")
-                      print("".join(h))
-
+                          dst_lines = dst_lines[:matches[0]] + added_only + dst_lines[matches[0]:]
               open(f, "w").writelines(dst_lines)
 
+          # 3. Compatibilizar MyMesh.h (NodePrefs alias, getStore, uiRepeatFreq y acceso public)
+          mymesh_h_path = "examples/companion_radio/MyMesh.h"
+          mh = open(mymesh_h_path, errors="ignore").read()
+          if "CompanionNodePrefs" in mh and "typedef CompanionNodePrefs NodePrefs;" not in mh:
+              mh = re.sub(r'(class\s+MyMesh\b)', r'typedef CompanionNodePrefs NodePrefs;\n\n\1', mh, count=1)
+
+          # Exponer metodos requeridos por UITask como public
+          for sig in [r'mishmeshSendText\s*\(', r'mishmeshRetransmit\s*\(', r'uiRepeatFreqCount\s*\(', r'uiRepeatFreqKhz\s*\(']:
+              mh = re.sub(rf'(^[ \t]*[^\n]*\b{sig})', r'public:\n\1', mh, flags=re.M)
+
+          # Agregar getStore() si UITask lo pide y falta en MyMesh.h
+          if "getStore(" not in mh:
+              m_store = re.search(r'\b(\w*Store)\s*\*\s*(\w+)\s*;', mh)
+              if m_store:
+                  mh = re.sub(
+                      r'(class\s+MyMesh\b[^{]*\{)',
+                      rf'\1\npublic:\n  {m_store.group(1)}* getStore() {{ return {m_store.group(2)}; }}\n',
+                      mh,
+                      count=1
+                  )
+
+          # Copiar uiRepeatFreqCount / uiRepeatFreqKhz desde _mishmesh si faltan
+          mish_mh = open("_mishmesh/examples/companion_radio/MyMesh.h", errors="ignore").read()
+          for fn in ["uiRepeatFreqCount", "uiRepeatFreqKhz"]:
+              if fn not in mh and fn in mish_mh:
+                  m_fn = re.search(rf'([^\n]*\b{fn}\s*\([^)]*\)[^{{;]*\{{[\s\S]*?\n  \}})', mish_mh)
+                  if m_fn:
+                      mh = re.sub(r'(class\s+MyMesh\b[^{]*\{)', rf'\1\npublic:\n{m_fn.group(1)}\n', mh, count=1)
+
+          open(mymesh_h_path, "w").write(mh)
+
+          # 4. Adaptar ui-mishmesh/UITask.h a AbstractUITask.h de MediaMesh
+          abs_ui = open("examples/companion_radio/AbstractUITask.h", errors="ignore").read()
+          uitask_h_path = "examples/companion_radio/ui-mishmesh/UITask.h"
+          uh = open(uitask_h_path, errors="ignore").read()
+
+          if "_node_prefs" not in abs_ui and "_node_prefs" not in uh:
+              uh = re.sub(r'(class\s+UITask\b[^{]*\{)', r'\1\nprotected:\n  NodePrefs* _node_prefs = nullptr;\npublic:\n', uh, count=1)
+
+          # Implementar metodos virtuales puros nuevos de AbstractUITask (ej. newMsg)
+          pure_virtuals = re.findall(r'virtual\s+([^{;=]+?\([^;]*\)\s*(?:const)?)\s*=\s*0\s*;', abs_ui)
+          extra_overrides = []
+          for pv in pure_virtuals:
+              pv_clean = " ".join(pv.split())
+              m_name = re.search(r'\b(\w+)\s*\(', pv_clean)
+              if not m_name:
+                  continue
+              fn_name = m_name.group(1)
+              if re.search(rf'\b{fn_name}\s*\(', uh):
+                  continue
+              ret_type = pv_clean[:m_name.start()].strip()
+              if ret_type == "void":
+                  body = "{}"
+              elif ret_type == "bool":
+                  body = "{ return false; }"
+              else:
+                  body = "{ return 0; }"
+              extra_overrides.append(f"  {pv_clean} override {body}")
+              print("Agregando override faltante en UITask.h:", pv_clean)
+
+          if extra_overrides:
+              uh = re.sub(
+                  r'(class\s+UITask\b[^{]*\{)',
+                  "\\1\npublic:\n" + "\n".join(extra_overrides) + "\n",
+                  uh,
+                  count=1
+              )
+          open(uitask_h_path, "w").write(uh)
+
+          # 5. Conectar UITask en main.cpp de MediaMesh sin duplicar the_mesh
+          main_path = "examples/companion_radio/main.cpp"
+          main_txt = open(main_path, errors="ignore").read()
+          mish_main = open("_mishmesh/examples/companion_radio/main.cpp", errors="ignore").read()
+
+          if "ui-mishmesh/UITask.h" not in main_txt:
+              main_txt = re.sub(
+                  r'(#include\s+"ui-[^"]+/UITask\.h")',
+                  r'#ifdef UI_MISHMESH\n#include "ui-mishmesh/UITask.h"\n#else\n\1\n#endif',
+                  main_txt,
+                  count=1
+              )
+              m_inst = re.search(r'^\s*(UITask\s+ui_task\b[^;]*;)', mish_main, flags=re.M)
+              if m_inst:
+                  mish_inst_line = m_inst.group(1).strip()
+                  main_txt = re.sub(
+                      r'^(\s*)(UITask\s+ui_task\b[^;]*;)',
+                      rf'#ifdef UI_MISHMESH\n\1{mish_inst_line}\n#else\n\1\2\n#endif',
+                      main_txt,
+                      count=1,
+                      flags=re.M
+                  )
+              open(main_path, "w").write(main_txt)
+              print("main.cpp enlazado con UI_MISHMESH sin duplicar the_mesh")
+
+          # 6. Agregar secciones de platformio.ini de Mishmesh
           def parse_sections(text):
               sections, order, cur, buf = {}, [], None, []
               for line in text.splitlines(keepends=True):
                   m = re.match(r'^\[([^\]]+)\]\s*$', line)
                   if m:
-                      if cur is not None:
-                          sections[cur] = "".join(buf)
+                      if cur is not None: sections[cur] = "".join(buf)
                       cur = m.group(1).strip()
                       order.append(cur)
                       buf = [line]
                   elif cur is not None:
                       buf.append(line)
-              if cur is not None:
-                  sections[cur] = "".join(buf)
+              if cur is not None: sections[cur] = "".join(buf)
               return sections, order
 
           src_ini = next((p for p in glob.glob("_mishmesh/**/platformio.ini", recursive=True)
@@ -161,7 +218,10 @@ jobs:
 
           with open(dst_ini, "a") as f:
               for s in to_add:
-                  f.write("\n\n" + src_secs[s].strip() + "\n")
+                  if s == "env:WioTrackerL1_companion_radio_ble_mishmesh" and "-D UI_MISHMESH" not in src_secs[s]:
+                      f.write("\n\n" + src_secs[s].strip() + "\n  -D UI_MISHMESH=1\n")
+                  else:
+                      f.write("\n\n" + src_secs[s].strip() + "\n")
           EOF
 
       - name: Instalar PlatformIO
