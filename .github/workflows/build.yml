@@ -9,8 +9,6 @@ jobs:
     steps:
       - name: Descargar base MediaMesh
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Descargar interfaz Mishmesh
         run: git clone https://github.com/burakcan/MeshCore-mishmesh.git _mishmesh
@@ -20,29 +18,23 @@ jobs:
           cp -r _mishmesh/mishmesh ./mishmesh
           cp -r _mishmesh/examples/companion_radio/ui-mishmesh ./examples/companion_radio/ui-mishmesh
 
-          git -C _mishmesh remote add upstream https://github.com/meshcore-dev/MeshCore.git
-          git -C _mishmesh fetch upstream --tags
-          git fetch ./_mishmesh HEAD
+          FIRST_MISH=$(git -C _mishmesh log --reverse --format=%H -- mishmesh examples/companion_radio/ui-mishmesh | head -n 1)
+          BASE_COMMIT="${FIRST_MISH}~1"
+          echo "Commit base de Mishmesh: $BASE_COMMIT"
 
-          BASE=$(python3 - << 'EOF'
-          import subprocess
-          refs = subprocess.check_output(["git", "-C", "_mishmesh", "for-each-ref", "--format=%(refname)", "refs/remotes/upstream"]).decode().splitlines()
-          best_base, best_dist = None, 10**9
-          for r in refs:
-              try:
-                  mb = subprocess.check_output(["git", "-C", "_mishmesh", "merge-base", r, "HEAD"]).decode().strip()
-                  dist = int(subprocess.check_output(["git", "-C", "_mishmesh", "rev-list", "--count", f"{mb}..HEAD"]).decode().strip())
-                  if dist < best_dist:
-                      best_dist = dist
-                      best_base = mb
-              except Exception:
-                  pass
-          print(best_base)
-          EOF
-          )
-          echo "Base commit: $BASE"
-          git -C _mishmesh diff "$BASE" HEAD -- examples/companion_radio/ src/ > mishmesh_core.patch
-          git apply --3way mishmesh_core.patch || true
+          for f in $(git -C _mishmesh diff --name-only "$BASE_COMMIT" HEAD -- examples/companion_radio/ src/); do
+            if [ -f "_mishmesh/$f" ]; then
+              if [ -f "$f" ] && git -C _mishmesh cat-file -e "$BASE_COMMIT:$f" 2>/dev/null; then
+                echo "Fusionando: $f"
+                git -C _mishmesh show "$BASE_COMMIT:$f" > /tmp/base_file
+                git merge-file "$f" /tmp/base_file "_mishmesh/$f" || true
+              elif [ ! -f "$f" ]; then
+                echo "Copiando nuevo: $f"
+                mkdir -p "$(dirname "$f")"
+                cp "_mishmesh/$f" "$f"
+              fi
+            fi
+          done
 
           python3 - << 'EOF'
           import glob, os, re
@@ -65,11 +57,15 @@ jobs:
                               i += 1
                               out.extend(ours)
                               for l in theirs:
-                                  if l not in ours or l.strip() in ("", "{", "}", "#endif"):
+                                  if l not in ours or l.strip() in ("", "{", "}", "#endif", "#else", "break;", "return;"):
                                       out.append(l)
                           else:
                               out.append(lines[i]); i += 1
                       open(path, "w").writelines(out)
+
+          mymesh_h = open("examples/companion_radio/MyMesh.h", errors="ignore").read()
+          assert "mishmeshSendText" in mymesh_h, "Error: MyMesh.h no recibio los metodos de Mishmesh"
+          print("Verificacion OK: MyMesh.h incluye Mishmesh")
 
           def parse_sections(text):
               sections, order, cur, buf = {}, [], None, []
